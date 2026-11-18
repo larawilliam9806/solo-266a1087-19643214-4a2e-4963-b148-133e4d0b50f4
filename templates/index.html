@@ -81,10 +81,30 @@
   </section>
 
   <section>
-    <h2>③ 当日状态与已发布结果</h2>
+    <h2>③ 次日回乘查询(仅显示加噪结果)</h2>
+    <label for="rDate">首日日期(次日按日历日自动确定)</label>
+    <input type="date" id="rDate">
+    <div class="hint" id="rNextHint">次日须同样上传源数据;两日均会被锁定。</div>
+    <div class="row">
+      <div>
+        <label>首日进站集合(按住 Ctrl/⌘ 多选)</label>
+        <select id="rInSel" multiple></select>
+      </div>
+      <div>
+        <label>首日出站集合(按住 Ctrl/⌘ 多选)</label>
+        <select id="rOutSel" multiple></select>
+      </div>
+    </div>
+    <button id="returnBtn" type="button">查询次日回乘人数</button>
+    <div class="msg" id="returnMsg"></div>
+    <div class="result" id="returnResult"></div>
+  </section>
+
+  <section>
+    <h2>④ 当日状态与已发布结果</h2>
     <div class="badges" id="statusBadges"></div>
     <table id="historyTable">
-      <thead><tr><th>#</th><th>进站集合</th><th>出站集合</th><th>加噪人数</th><th>发布时间(UTC)</th></tr></thead>
+      <thead><tr><th>#</th><th>类型</th><th>进站集合</th><th>出站集合</th><th>加噪人数</th><th>发布时间(UTC)</th></tr></thead>
       <tbody></tbody>
     </table>
   </section>
@@ -95,6 +115,13 @@ const $ = id => document.getElementById(id);
 function showMsg(el, text, ok) {
   el.textContent = text;
   el.className = "msg " + (ok ? "ok" : "err");
+}
+
+function nextDate(date) {
+  if (!date) return "";
+  const d = new Date(date + "T00:00:00");
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().slice(0, 10);
 }
 
 async function refreshStations() {
@@ -110,14 +137,31 @@ async function refreshStations() {
   }
 }
 
+async function refreshReturnStations() {
+  const date = $("rDate").value;
+  $("rInSel").innerHTML = ""; $("rOutSel").innerHTML = "";
+  $("rNextHint").textContent = date
+    ? `首日 ${date},次日 ${nextDate(date)}(两日都须有源数据,查询后两日均锁定)`
+    : "次日须同样上传源数据;两日均会被锁定。";
+  if (!date) return;
+  const res = await fetch("/api/stations?date=" + encodeURIComponent(date));
+  const data = await res.json();
+  if (!data.ok) return;
+  for (const s of data.stations) {
+    $("rInSel").add(new Option(s, s));
+    $("rOutSel").add(new Option(s, s));
+  }
+}
+
 async function refreshStatus() {
   const date = $("qDate").value;
   if (!date) return;
-  const [stRes, qRes] = await Promise.all([
+  const [stRes, qRes, rqRes] = await Promise.all([
     fetch("/api/status?date=" + encodeURIComponent(date)),
     fetch("/api/queries?date=" + encodeURIComponent(date)),
+    fetch("/api/return-queries?date=" + encodeURIComponent(date)),
   ]);
-  const st = await stRes.json(), q = await qRes.json();
+  const st = await stRes.json(), q = await qRes.json(), rq = await rqRes.json();
   if (st.ok) {
     $("statusBadges").innerHTML =
       `<span class="badge">源数据行数:${st.rows}</span>` +
@@ -126,9 +170,14 @@ async function refreshStatus() {
   }
   const tbody = $("historyTable").querySelector("tbody");
   tbody.innerHTML = "";
-  if (q.ok) q.queries.forEach((r, i) => {
+  const items = [];
+  if (q.ok) q.queries.forEach(r => items.push({ type: "单日", ...r }));
+  if (rq.ok) rq.queries.forEach(r => items.push({ type: "次日回乘", ...r }));
+  items.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  items.forEach((r, i) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${i + 1}</td><td>${r.in_stations.join("、")}</td>` +
+    tr.innerHTML = `<td>${i + 1}</td><td>${r.type}</td>` +
+      `<td>${r.in_stations.join("、")}</td>` +
       `<td>${r.out_stations.join("、")}</td><td>${r.noisy_count.toFixed(4)}</td>` +
       `<td>${r.created_at}</td>`;
     tbody.appendChild(tr);
@@ -174,9 +223,40 @@ $("queryBtn").addEventListener("click", async () => {
 });
 
 $("qDate").addEventListener("change", () => { refreshStations(); refreshStatus(); });
+
+$("returnBtn").addEventListener("click", async () => {
+  const pick = sel => Array.from(sel.selectedOptions).map(o => o.value);
+  const body = {
+    date: $("rDate").value,
+    in_stations: pick($("rInSel")),
+    out_stations: pick($("rOutSel")),
+  };
+  const res = await fetch("/return-query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  const msg = $("returnMsg"), out = $("returnResult");
+  if (data.ok) {
+    msg.className = "msg"; msg.style.display = "none";
+    out.style.display = "block";
+    out.innerHTML = `次日(${data.next_date})回乘人数(加噪后):<b>${data.noisy_count.toFixed(4)}</b>` +
+      `<div class="hint">${data.cached ? "相同查询,复用已发布结果,未扣费。" : "新查询,已从两日各扣 0.5 隐私预算,并锁定两日源数据。"}` +
+      (data.budget_remaining !== undefined
+        ? ` 首日剩余预算:${data.budget_remaining},次日剩余预算:${data.next_budget_remaining}` : "") +
+      `</div>`;
+  } else {
+    out.style.display = "none";
+    showMsg(msg, "查询失败:" + data.error, false);
+  }
+  refreshStatus();
+});
+
+$("rDate").addEventListener("change", refreshReturnStations);
 const today = new Date().toISOString().slice(0, 10);
-$("upDate").value = today; $("qDate").value = today;
-refreshStations(); refreshStatus();
+$("upDate").value = today; $("qDate").value = today; $("rDate").value = today;
+refreshStations(); refreshReturnStations(); refreshStatus();
 </script>
 </body>
 </html>

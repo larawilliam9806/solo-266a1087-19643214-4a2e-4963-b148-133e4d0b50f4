@@ -5,6 +5,9 @@
 - 每次新查询扣 0.5 隐私预算, 每日(每个数据日期)总额 2
 - 相同日期 + 相同站点集合(与顺序、重复无关)复用原结果, 不再扣费
 - 首个成功查询锁定当天源数据, 之后拒绝替换
+- 次日回乘查询: 首日符合站点条件的乘客中, 次日仍有首程记录的去重人数;
+  两日都须有源数据, 每次从两日各扣 0.5 并同时锁定两日,
+  与单日查询共用每日预算; 相同首日 + 相同站点集合复用原结果
 - 扣费 / 保存结果 / 锁定源数据在同一事务中, 要么全部成功要么全部不生效
 """
 
@@ -15,7 +18,7 @@ import math
 import os
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, g, jsonify, render_template, request
 
@@ -41,7 +44,8 @@ CREATE TABLE IF NOT EXISTS passengers (
 CREATE TABLE IF NOT EXISTS day_state (
     date         TEXT PRIMARY KEY,
     locked       INTEGER NOT NULL DEFAULT 0,
-    budget_spent REAL    NOT NULL DEFAULT 0
+    budget_spent REAL    NOT NULL DEFAULT 0,
+    version      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS queries (
@@ -54,6 +58,26 @@ CREATE TABLE IF NOT EXISTS queries (
     created_at   TEXT NOT NULL,
     PRIMARY KEY (date, in_key, out_key)
 );
+
+CREATE TABLE IF NOT EXISTS return_queries (
+    date         TEXT NOT NULL,
+    in_key       TEXT NOT NULL,
+    out_key      TEXT NOT NULL,
+    in_stations  TEXT NOT NULL,
+    out_stations TEXT NOT NULL,
+    noisy_count  REAL NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (date, in_key, out_key)
+);
+
+-- 次日回乘查询沿用的首日源数据版本: 保证结果对应同一时刻的两日完整快照
+CREATE TABLE IF NOT EXISTS return_snapshots (
+    date         TEXT NOT NULL,
+    in_key       TEXT NOT NULL,
+    out_key      TEXT NOT NULL,
+    day_version  INTEGER NOT NULL,
+    PRIMARY KEY (date, in_key, out_key)
+);
 """
 
 
@@ -63,6 +87,13 @@ def init_db():
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        # 旧库补列: day_state.version 标识源数据版本(每次整日替换 +1)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(day_state)")}
+        if "version" not in cols:
+            try:
+                conn.execute("ALTER TABLE day_state ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass  # 并发启动时另一进程已完成迁移
     finally:
         conn.close()
 
@@ -108,6 +139,22 @@ def normalize_date(raw):
         except ValueError:
             continue
     return None
+
+
+def next_day(date):
+    """YYYY-MM-DD 的次日(按日历日, 不受时区影响)."""
+    return (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def get_day_state(conn, date):
+    """读取某日状态; 不存在时返回 {locked: False, budget_spent: 0.0, version: 0}."""
+    row = conn.execute(
+        "SELECT locked, budget_spent, version FROM day_state WHERE date = ?",
+        (date,)).fetchone()
+    if row is None:
+        return {"locked": False, "budget_spent": 0.0, "version": 0}
+    return {"locked": bool(row["locked"]), "budget_spent": row["budget_spent"],
+            "version": row["version"]}
 
 
 def canon_key(stations):
@@ -241,12 +288,15 @@ def upload():
             conn.execute("ROLLBACK")
             return jsonify(ok=False,
                          error=f"{date} 的源数据已被首个成功查询锁定, 拒绝替换"), 409
-        # 未锁定: 整日替换
+        # 未锁定: 整日替换; 版本号 +1 使按旧快照发布的回乘结果失效
         conn.execute("DELETE FROM passengers WHERE date = ?", (date,))
         conn.executemany(
             "INSERT INTO passengers (date, passenger_id, in_station, out_station)"
             " VALUES (?, ?, ?, ?)",
             [(date, pid, in_s, out_s) for pid, in_s, out_s in rows])
+        conn.execute(
+            "INSERT INTO day_state (date, version) VALUES (?, 1)"
+            " ON CONFLICT(date) DO UPDATE SET version = version + 1", (date,))
         conn.execute("COMMIT")
     except Exception:
         if conn.in_transaction:
@@ -342,6 +392,131 @@ def query():
                    budget_remaining=round(DAILY_BUDGET - spent - QUERY_COST, 10))
 
 
+# ---------------------------------------------------------------- 次日回乘
+
+def return_match_count(conn, date, in_stations, out_stations):
+    """首日符合站点条件的乘客中, 次日仍有首程记录的去重人数(未加噪)."""
+    day2 = next_day(date)
+    placeholders_in = ",".join("?" for _ in in_stations)
+    placeholders_out = ",".join("?" for _ in out_stations)
+    return conn.execute(
+        f"SELECT COUNT(*) AS c FROM passengers AS d1"
+        f" JOIN passengers AS d2"
+        f"   ON d2.date = ? AND d2.passenger_id = d1.passenger_id"
+        f" WHERE d1.date = ? AND d1.in_station IN ({placeholders_in})"
+        f" AND d1.out_station IN ({placeholders_out})",
+        [day2, date, *in_stations, *out_stations]).fetchone()["c"]
+
+
+def get_cached_return_query(conn, date, in_key, out_key):
+    """取已发布且仍对应当前首日源数据的回乘结果; 首日数据已被替换则视为不存在."""
+    return conn.execute(
+        "SELECT q.noisy_count, q.in_stations, q.out_stations"
+        " FROM return_queries q"
+        " JOIN return_snapshots s"
+        "   ON s.date = q.date AND s.in_key = q.in_key AND s.out_key = q.out_key"
+        " JOIN day_state d ON d.date = q.date"
+        " WHERE q.date = ? AND q.in_key = ? AND q.out_key = ?"
+        "   AND d.locked = 1 AND d.version = s.day_version",
+        (date, in_key, out_key)).fetchone()
+
+
+def cached_return_response(cached, date, day2):
+    return jsonify(ok=True, date=date, next_date=day2,
+                   in_stations=json.loads(cached["in_stations"]),
+                   out_stations=json.loads(cached["out_stations"]),
+                   noisy_count=cached["noisy_count"], cached=True)
+
+
+@app.post("/return-query")
+def return_query():
+    payload = get_payload()
+    date = normalize_date(payload.get("date", ""))
+    if not date:
+        return jsonify(ok=False, error="日期缺失或格式不正确(应为 YYYY-MM-DD)"), 400
+    day2 = next_day(date)
+
+    in_stations = parse_station_list(payload.get("in_stations"))
+    out_stations = parse_station_list(payload.get("out_stations"))
+    if not in_stations or not out_stations:
+        return jsonify(ok=False, error="进站集合与出站集合均不能为空"), 400
+
+    in_key, out_key = canon_key(in_stations), canon_key(out_stations)
+    conn = get_db()
+
+    # 快速路径: 已发布且快照源数据未被替换, 直接复用原值(只读, 不扣费)
+    cached = get_cached_return_query(conn, date, in_key, out_key)
+    if cached:
+        return cached_return_response(cached, date, day2)
+
+    # 新查询: 两日各扣费 + 保存结果 + 同时锁定两日, 必须在同一事务中
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 事务内复查(并发下相同查询只生成一份结果)
+        cached = get_cached_return_query(conn, date, in_key, out_key)
+        if cached:
+            conn.execute("COMMIT")
+            return cached_return_response(cached, date, day2)
+
+        # 两日都须有源数据
+        missing = [d for d in (date, day2) if conn.execute(
+            "SELECT 1 FROM passengers WHERE date = ? LIMIT 1", (d,)).fetchone() is None]
+        if missing:
+            conn.execute("ROLLBACK")
+            return jsonify(ok=False,
+                           error="源数据缺失: " + "、".join(missing) +
+                                 " 尚无已上传的数据, 两日均须有源数据"), 409
+
+        # 两日预算都要够(与原单日查询共用每日预算)
+        states = {d: get_day_state(conn, d) for d in (date, day2)}
+        short = [d for d in (date, day2)
+                 if states[d]["budget_spent"] + QUERY_COST > DAILY_BUDGET + 1e-9]
+        if short:
+            detail = "、".join(
+                f"{d}(已用 {states[d]['budget_spent']:g}/{DAILY_BUDGET:g})" for d in short)
+            conn.execute("ROLLBACK")
+            return jsonify(ok=False,
+                           error=f"隐私预算不足: {detail}, 本次需在两日各扣 "
+                                 f"{QUERY_COST:g}, 不返回新结果"), 403
+
+        # 先算出结果并写入(写事务内快照一致); 保存失败同样整体回滚
+        true_count = return_match_count(conn, date, in_stations, out_stations)
+        noisy_count = true_count + laplace_noise()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT OR REPLACE INTO return_queries"
+            " (date, in_key, out_key, in_stations, out_stations, noisy_count, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (date, in_key, out_key, json.dumps(in_stations, ensure_ascii=False),
+             json.dumps(out_stations, ensure_ascii=False), noisy_count, now))
+        conn.execute(
+            "INSERT OR REPLACE INTO return_snapshots"
+            " (date, in_key, out_key, day_version) VALUES (?, ?, ?, ?)",
+            (date, in_key, out_key, states[date]["version"]))
+        # 两日同时扣费并锁定(与单日查询共用同一份每日预算)
+        for d in (date, day2):
+            conn.execute(
+                "INSERT INTO day_state (date, locked, budget_spent, version)"
+                " VALUES (?, 1, ?, 0)"
+                " ON CONFLICT(date) DO UPDATE SET locked = 1,"
+                " budget_spent = budget_spent + excluded.budget_spent",
+                (d, QUERY_COST))
+        # 事务提交成功才算发布; 提交后再响应, 响应丢失/重启后重查返回原值
+        conn.execute("COMMIT")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+    return jsonify(ok=True, date=date, next_date=day2,
+                   in_stations=in_stations, out_stations=out_stations,
+                   noisy_count=noisy_count, cached=False,
+                   budget_remaining=round(
+                       DAILY_BUDGET - states[date]["budget_spent"] - QUERY_COST, 10),
+                   next_budget_remaining=round(
+                       DAILY_BUDGET - states[day2]["budget_spent"] - QUERY_COST, 10))
+
+
 # ---------------------------------------------------------------- 状态接口
 
 @app.get("/api/stations")
@@ -386,6 +561,22 @@ def api_queries():
         "SELECT in_stations, out_stations, noisy_count, created_at"
         " FROM queries WHERE date = ? ORDER BY created_at, rowid", (date,)).fetchall()
     return jsonify(ok=True, date=date, queries=[
+        {"in_stations": json.loads(r["in_stations"]),
+         "out_stations": json.loads(r["out_stations"]),
+         "noisy_count": r["noisy_count"],
+         "created_at": r["created_at"]} for r in rows])
+
+
+@app.get("/api/return-queries")
+def api_return_queries():
+    date = normalize_date(request.args.get("date", ""))
+    if not date:
+        return jsonify(ok=False, error="日期缺失或格式不正确"), 400
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT in_stations, out_stations, noisy_count, created_at"
+        " FROM return_queries WHERE date = ? ORDER BY created_at, rowid", (date,)).fetchall()
+    return jsonify(ok=True, date=date, next_date=next_day(date), queries=[
         {"in_stations": json.loads(r["in_stations"]),
          "out_stations": json.loads(r["out_stations"]),
          "noisy_count": r["noisy_count"],
